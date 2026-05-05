@@ -1,2 +1,2 @@
 # Info
-This is a Test, see [original Azure PAYG Repo](https://github.com/tzuehlke/AzurePAYGPrices).
+This is the follow up Repo of the [original Azure PAYG Repo](https://github.com/tzuehlke/AzurePAYGPrices).
