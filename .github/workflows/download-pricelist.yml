@@ -1,0 +1,77 @@
+name: download-pricelist
+
+on:
+  schedule:
+  - cron: "0 6 5 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  download-and-checkin-azure-prices:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: 'Get Azure Prices and commit'
+        shell: pwsh
+        run: |
+          git config --global user.name 'Workflow'
+          git config --global user.email 'tzuehlke@users.noreply.github.com'
+          Write-Output "Downloading MCA Prices..."
+          $countalllines = 0
+          $countfilelines = 0
+          $countfiles = 0
+          $linestosplitfiles = 125000
+          $url = "https://prices.azure.com/api/retail/prices?api-version=2021-10-01-preview&currencyCode='EUR'"
+          $prices = @()
+          $start = Get-Date
+          do{
+              $resp = Invoke-RestMethod `
+                  -Method Get `
+                  -ContentType "application/json; charset=utf-8" `
+                  -ResponseHeadersVariable respHeaders `
+                  -SkipHttpErrorCheck `
+                  -StatusCodeVariable "respStatusCode" `
+                  -Uri $url
+              if($respStatusCode -eq "429"){
+                Write-Output "waiting for 61 seconds because of 429 response"
+                Start-Sleep -Seconds (61)
+                continue
+              }
+              $currentDate = Get-Date
+              $resp.Items | % {
+                  Add-Member -InputObject $_ -NotePropertyName "retrievalDate" -NotePropertyValue $currentDate
+              }
+              $prices += $resp.Items
+              $countalllines += $resp.Count
+              $countfilelines += $resp.Count
+              if($countfilelines -ge $linestosplitfiles){
+                  Write-Output "start export of $($prices.Count)"
+                  $filename = "mca-$($start.ToString("yyyy-MM-dd_HH-mm-ss"))_p$('{0:d2}' -f $countfiles)"
+                  #$prices | ConvertTo-Json | Out-File "$filename.json"
+                  $prices | Export-Csv -Path "$filename.csv" -Delimiter ';' -NoTypeInformation -Encoding UTF8
+                  $countfilelines = 0
+                  $countfiles++
+                  $prices = @()
+              }
+              Write-Output "retrieved $countalllines, open calls tills timeout $($respHeaders."x-ms-ratelimit-remaining-retailPrices-requests")"
+              $url = $resp.NextPageLink
+              if($respHeaders."x-ms-ratelimit-remaining-retailPrices-requests" -eq 0){
+                  $wait = [int]($respHeaders."x-ms-ratelimit-retailPrices-retry-after"[0])
+                  Write-Output "waiting $wait seconds"
+                  Start-Sleep -Seconds ($wait)
+              }
+          }while($url)
+          Write-Output "start export of $($prices.Count)"
+          $filename = "mca-$($start.ToString("yyyy-MM-dd_HH-mm-ss"))_p$('{0:d2}' -f $countfiles)"
+          $prices | Export-Csv -Path "$filename.csv" -Delimiter ';' -NoTypeInformation -Encoding UTF8
+          $end = Get-Date
+          Write-Output "started $start"
+          Write-Output "end $end"
+          git status -s
+          git add -A
+          git commit -m "Added price lists by workflow"
+          git push
