@@ -20,15 +20,58 @@ jobs:
         run: |
           git config --global user.name 'Workflow'
           git config --global user.email 'tzuehlke@users.noreply.github.com'
+          
           Write-Output "Downloading MCA Prices..."
           $countalllines = 0
           $countfilelines = 0
           $countfiles = 0
           $linestosplitfiles = 125000
-          $url = "https://prices.azure.com/api/retail/prices?api-version=2021-10-01-preview&currencyCode='EUR'"
-          $prices = @()
+          $baseUrl = "https://prices.azure.com/api/retail/prices?api-version=2021-10-01-preview&currencyCode='EUR'"
+          $prices = [System.Collections.Generic.List[object]]::new()
           $start = Get-Date
-          do{
+          
+          # fixed csv columns: every record is normalized to these before export, missing values stay empty.
+          # Export-Csv would otherwise take the columns from the first record of a file, and the API leaves
+          # out fields like reservationTerm or effectiveEndDate when they are not set.
+          $columns = [System.Collections.Generic.List[string]]::new()
+          $columns.AddRange([string[]]@(
+            "currencyCode","tierMinimumUnits","reservationTerm","retailPrice","unitPrice","armRegionName","location",
+            "effectiveStartDate","effectiveEndDate","meterId","meterName","productId","skuId","productName","skuName",
+            "serviceName","serviceId","serviceFamily","unitOfMeasure","type","isPrimaryMeterRegion","armSkuName",
+            "retrievalDate"
+          ))
+          $knownColumns = [System.Collections.Generic.HashSet[string]]::new($columns)
+          # fields the API returned that are not in the list above: they are exported as extra columns,
+          # but the script ends with an error at the end
+          $unknownFields = [System.Collections.Generic.List[object]]::new()
+          
+          function Register-UnknownFields($items, $sliceName){
+            foreach($item in $items){
+              foreach($name in $item.PSObject.Properties.Name){
+                if($knownColumns.Add($name)){
+                  $columns.Add($name)
+                  $unknownFields.Add([pscustomobject]@{
+                    Field  = $name
+                    Slice  = $sliceName
+                    Record = ($item | ConvertTo-Json -Compress)
+                  })
+                  Write-Output "WARNING: unknown field '$name' in slice '$sliceName', exported as additional column"
+                }
+              }
+            }
+          }
+          
+          function Export-Prices($path){
+            $prices | % {
+              $row = [ordered]@{}
+              foreach($column in $columns){ $row[$column] = $_.$column }
+              [pscustomobject]$row
+            } | Export-Csv -Path $path -Delimiter ';' -NoTypeInformation -Encoding UTF8
+          }
+          
+          
+          function Invoke-PriceApi($url){
+            while($true){
               $resp = Invoke-RestMethod `
                   -Method Get `
                   -ContentType "application/json; charset=utf-8" `
@@ -36,41 +79,89 @@ jobs:
                   -SkipHttpErrorCheck `
                   -StatusCodeVariable "respStatusCode" `
                   -Uri $url
-              if($respStatusCode -eq "429"){
+              if($respStatusCode -eq 429){
                 Write-Output "waiting for 61 seconds because of 429 response"
                 Start-Sleep -Seconds (61)
                 continue
               }
+              if($respStatusCode -ne 200){
+                throw "API returned status $respStatusCode for $url : $($resp | ConvertTo-Json -Compress)"
+              }
+              $remaining = $respHeaders."x-ms-ratelimit-remaining-retailPrices-requests"
+              if($remaining -eq 0){
+                $wait = [int]($respHeaders."x-ms-ratelimit-retailPrices-retry-after"[0])
+                Write-Output "waiting $wait seconds"
+                Start-Sleep -Seconds ($wait)
+              }
+              return $resp
+            }
+          }
+          
+          # the API stops at 1,000,000 rows per query, so the prices are queried in slices by the first
+          # character of armRegionName (startswith is case sensitive, so a-z and A-Z are separate slices).
+          # The region names are not consistent (westeurope, Zone 1, Global, ...), the empty name is its own slice.
+          # Every record has exactly one region name, so the slices do not overlap.
+          $maxRowsPerQuery = 1000000
+          $slices = @([ordered]@{ Name = "(empty)"; Filter = "armRegionName eq ''" })
+          foreach($char in ([char[]](97..122) + [char[]](65..90))){
+            $slices += [ordered]@{ Name = "$char*"; Filter = "startswith(armRegionName,'$char')" }
+          }
+          
+          # download per slice, csv files are split by row count across slices
+          $sliceNr = 0
+          foreach($slice in $slices){
+            $sliceNr++
+            $slicelines = 0
+            $url = "$baseUrl&`$filter=" + [uri]::EscapeDataString($slice.Filter)
+            do{
+              Write-Output "now calling: $url"
+              $resp = Invoke-PriceApi $url
+              Write-Output "and get $($resp.Items.Count) for slice '$($slice.Name)' ($sliceNr/$($slices.Count))"
               $currentDate = Get-Date
               $resp.Items | % {
                   Add-Member -InputObject $_ -NotePropertyName "retrievalDate" -NotePropertyValue $currentDate
               }
-              $prices += $resp.Items
-              $countalllines += $resp.Count
-              $countfilelines += $resp.Count
+              Register-UnknownFields $resp.Items $slice.Name
+              $prices.AddRange(@($resp.Items))
+              $countalllines += $resp.Items.Count
+              $countfilelines += $resp.Items.Count
+              $slicelines += $resp.Items.Count
               if($countfilelines -ge $linestosplitfiles){
                   Write-Output "start export of $($prices.Count)"
                   $filename = "mca-$($start.ToString("yyyy-MM-dd_HH-mm-ss"))_p$('{0:d2}' -f $countfiles)"
                   #$prices | ConvertTo-Json | Out-File "$filename.json"
-                  $prices | Export-Csv -Path "$filename.csv" -Delimiter ';' -NoTypeInformation -Encoding UTF8
+                  Export-Prices "$filename.csv"
                   $countfilelines = 0
                   $countfiles++
-                  $prices = @()
+                  $prices.Clear()
               }
-              Write-Output "retrieved $countalllines, open calls tills timeout $($respHeaders."x-ms-ratelimit-remaining-retailPrices-requests")"
+              Write-Output "retrieved $countalllines"
               $url = $resp.NextPageLink
-              if($respHeaders."x-ms-ratelimit-remaining-retailPrices-requests" -eq 0){
-                  $wait = [int]($respHeaders."x-ms-ratelimit-retailPrices-retry-after"[0])
-                  Write-Output "waiting $wait seconds"
-                  Start-Sleep -Seconds ($wait)
+              if($slicelines -ge $maxRowsPerQuery -and $url){
+                throw "slice '$($slice.Name)' reached the API limit of $maxRowsPerQuery rows, the data would be incomplete. Split the slice further."
               }
-          }while($url)
-          Write-Output "start export of $($prices.Count)"
-          $filename = "mca-$($start.ToString("yyyy-MM-dd_HH-mm-ss"))_p$('{0:d2}' -f $countfiles)"
-          $prices | Export-Csv -Path "$filename.csv" -Delimiter ';' -NoTypeInformation -Encoding UTF8
+            }while($url)
+            Write-Output "slice '$($slice.Name)' done with $slicelines rows"
+          }
+          if($prices.Count -gt 0){
+            Write-Output "start export of $($prices.Count)"
+            $filename = "mca-$($start.ToString("yyyy-MM-dd_HH-mm-ss"))_p$('{0:d2}' -f $countfiles)"
+            Export-Prices "$filename.csv"
+          }
           $end = Get-Date
           Write-Output "started $start"
           Write-Output "end $end"
+          Write-Output "total rows $countalllines"
+          
+          if($unknownFields.Count -gt 0){
+            Write-Error "API returned $($unknownFields.Count) field(s) that are not in the column list: $(($unknownFields.Field) -join ', '). They were exported as additional columns, but the files do not all have the same columns. Add the fields to `$columns."
+            foreach($unknown in $unknownFields){
+              Write-Output "first record with unknown field '$($unknown.Field)' (slice '$($unknown.Slice)'):"
+              Write-Output $unknown.Record
+            }
+            exit 1
+          }
+
           git status -s
           git add -A
           git commit -m "Added price lists by workflow"
